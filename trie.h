@@ -85,9 +85,8 @@
      * 
      * @param t trie tree
      * @param ip IP of subnet
-     * @param ln length of IP (32/128)
      * @param as store value to
      * @return if success than >0 else 0
      */
-    uint8_t trie_node_search(trie_t *t, uint8_t *ip, uint8_t ln, uint32_t *next_hop_ip, uint8_t *next_hop_interface);
+    uint8_t trie_node_search(trie_t *t, uint8_t *ip, uint32_t *next_hop_ip, uint8_t *next_hop_interface);
 #endif

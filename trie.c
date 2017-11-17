@@ -97,10 +97,10 @@ void trie_node_put(trie_t *t, uint8_t *ip, uint8_t cidr, uint32_t next_hop_ip, u
     int i;
 
     // add each bit of address prefix to tree
-    for (i = 0; i < cidr/8; i++)
+    for (i = 0; i < cidr; i++)
     {
         // bit is 1 => go right
-        if ((ip[i] >> (7 - i % 8)) & 1)
+        if (((ip[i / 8] >> (7 - i % 8)) & 1) > 0)
         {
             // create path if not exists
             if (current->r == NULL)
@@ -135,23 +135,25 @@ void trie_node_put(trie_t *t, uint8_t *ip, uint8_t cidr, uint32_t next_hop_ip, u
  *
  * @param t trie tree
  * @param ip IP of subnet
- * @param ln length of IP (32/128)
+ * @param ln length of IP (4/16)
  * @param location to store next hop ip
  * @param location to store next hop interface
  * @return if success than >0 else 0
  */
-uint8_t trie_node_search(trie_t *t, uint8_t *ip, uint8_t ln, uint32_t *next_hop_ip, uint8_t *next_hop_interface)
+uint8_t trie_node_search(trie_t *t, uint8_t *ip, uint32_t *next_hop_ip, uint8_t *next_hop_interface)
 {
     node_t *current = t->root;
     uint8_t found = 0;
-    int i, u;
+    uint8_t byte;
+    int i = 0;
+    int j;
 
-    for (i = 0; i < (ln/8); i++)
-    {
-        for (u = 7; u >= 0; u--)
+    while(1) {
+        byte = ip[i++];
+        for (j=0; j<8; j++)
         {
             // search right
-            if ((ip[i] >> u) & 1)
+            if (byte & 0x80)
             {
                 current = current->r;
             }
@@ -172,6 +174,7 @@ uint8_t trie_node_search(trie_t *t, uint8_t *ip, uint8_t ln, uint32_t *next_hop_
                 *next_hop_ip = current->next_hop_ip;
                 found = 1;
             }
+            byte <<= 1;
         }
     }
 
