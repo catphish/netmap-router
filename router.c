@@ -102,7 +102,7 @@ void *forward(void *c)
       }
       // Release lock
       pthread_mutex_unlock(locks+next_hop_interface);
-      // Advance tje RX ring pointer
+      // Advance the RX ring pointer
       rxring->head = rxring->cur = nm_ring_next(rxring, rxring->cur);
     }
 
