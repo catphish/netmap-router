@@ -1,13 +1,14 @@
+#define _GNU_SOURCE
 #define NETMAP_WITH_LIBS
 #include <fcntl.h>
 #include <stdio.h>
 #include <net/netmap_user.h>
-#include <sys/poll.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <arpa/inet.h>
 #include <pthread.h>
+#include <sched.h>
 #include <unistd.h>
 #include "trie.h"
 #include "router.h"
@@ -25,16 +26,14 @@ void *thread_main(void * f) {
   struct netmap_if *nifps[NIC_COUNT];   // Interfaces
   struct netmap_ring *rxrings[NIC_COUNT]; // RX rings
   struct netmap_ring *txrings[NIC_COUNT]; // TX rings
-  char tx_waiting[NIC_COUNT];
   memset(reqs, 0, sizeof(struct nmreq) * NIC_COUNT);
-  memset(tx_waiting, 1, NIC_COUNT);
 
   for(int n=0; n<NIC_COUNT;n++) {
     fds[n] = open("/dev/netmap", O_RDWR);  // Open a generic netmap socket
     strcpy(reqs[n].nr_name, nic_names[n]); // Copy NIC name into request
     reqs[n].nr_version = NETMAP_API;       // Set version number
     reqs[n].nr_flags = NR_REG_ONE_NIC;     // We will be using a single hardware ring
-    reqs[n].nr_ringid = NETMAP_NO_TX_POLL | NETMAP_HW_RING | forwarder->id; // Select ring, disable TX on poll
+    reqs[n].nr_ringid = forwarder->id; // Select ring, disable TX on poll
     ioctl(fds[n], NIOCREGIF, &reqs[n]);       // Initialize netmap
 
     //printf("interface: %s\n", reqs[n].nr_name);
@@ -46,15 +45,10 @@ void *thread_main(void * f) {
   mem = mmap(NULL, reqs[0].nr_memsize, PROT_READ|PROT_WRITE, MAP_SHARED, fds[0], 0);
   printf("mmap: %p\n", mem);
 
-  struct pollfd pollfds[NIC_COUNT];
-
   for(int n=0; n<NIC_COUNT;n++) {
     nifps[n] = NETMAP_IF(mem, reqs[n].nr_offset); // Locate port memory
     rxrings[n] = NETMAP_RXRING(nifps[n], forwarder->id); // Set up pointer to RX ring
     txrings[n] = NETMAP_TXRING(nifps[n], forwarder->id); // Set up pointer to TX ring
-
-    pollfds[n].fd = fds[n];
-    pollfds[n].events = POLLIN;
   }
 
   // Pointers for the RX ring and TX ring
@@ -69,22 +63,27 @@ void *thread_main(void * f) {
   char *rxbuf;
   char *txbuf;
 
+  unsigned int batch_total;
+  unsigned int batch_count;
+
   while (1) {
-    //usleep(20);
-    poll(pollfds, NIC_COUNT, -1);
-    //printf("Poll! Ring:%u Pollfds: %u %u %u %u\n", forwarder->id, pollfds[0].revents, pollfds[1].revents,pollfds[2].revents,pollfds[3].revents);
+    usleep(500);
+    if(batch_count == 10000) {
+      printf("Average batch: %u\n", batch_total / batch_count);
+      batch_total = 0;
+      batch_count = 0;
+    }
+    batch_count++;
     for(int n=0; n<NIC_COUNT; n++) {
-      //ioctl(fds[n], NIOCRXSYNC);
-      if(tx_waiting[n]) {
-        ioctl(fds[n], NIOCTXSYNC);
-        tx_waiting[n] = 0;
-      }
+      ioctl(fds[n], NIOCTXSYNC);
+      ioctl(fds[n], NIOCRXSYNC);
       rxring = rxrings[n];
       //printf("Checking NIC. Interface:%u Ring:%u Info: %u %u %u\n", n, forwarder->id, rxring->head, rxring->cur, rxring->tail);
       while (!nm_ring_empty(rxring)) {
+        batch_total++;
         //printf("Frame received. Interface:%u Ring:%u\n", n, forwarder->id);
         rxbuf = NETMAP_BUF(rxring, rxring->slot[rxring->cur].buf_idx);
-        trie_node_search(&t4, rxbuf+30, &next_hop_ip, &next_hop_interface);
+        //trie_node_search(&t4, rxbuf+30, &next_hop_ip, &next_hop_interface);
         txring = txrings[next_hop_interface];
         if(txring->cur != txring->tail) {
           // Copy the packet length and data from RX to TX
@@ -100,8 +99,9 @@ void *thread_main(void * f) {
 
           // Advance the TX ring pointer
           txring->head = txring->cur = nm_ring_next(txring, txring->cur);
+        //} else {
+        //  printf(".");
         }
-        tx_waiting[next_hop_interface] = 1;
         rxrings[n]->head = rxrings[n]->cur = nm_ring_next(rxrings[n], rxrings[n]->cur);
       }
     }
@@ -127,6 +127,10 @@ int main(int argc, char **argv)
   for(int n=0; n<RING_COUNT; n++) {
     forwarder[n].id = n;
     pthread_create(&forwarder[n].thread, NULL, thread_main, &forwarder[n]);
+    cpu_set_t cpumask;
+    CPU_ZERO(&cpumask);
+    CPU_SET(n, &cpumask);
+    pthread_setaffinity_np(forwarder[n].thread, sizeof(cpu_set_t), &cpumask);
   }
 
   // Join threads for completeness
