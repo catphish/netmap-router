@@ -1,3 +1,4 @@
+#define NETMAP_WITH_LIBS
 #include <fcntl.h>
 #include <stdio.h>
 #include <net/netmap_user.h>
@@ -11,105 +12,98 @@
 #include "trie.h"
 #include "router.h"
 
-#define NIC_MAX 4
-
-// Set up variables for the required number of interfaces
+#define NIC_COUNT 4
+#define RING_COUNT 4
 char *nic_names[] = {"enp8s0f0","enp8s0f1","enp8s0f2","enp8s0f3"};
-struct nmreq nmreqs[NIC_MAX];         // netmap request
-struct netmap_if *nifps[NIC_MAX];     // netmap interface
-struct netmap_ring *rxrings[NIC_MAX]; // RX ring
-struct netmap_ring *txrings[NIC_MAX]; // TX ring
-struct forwarder forwarders[NIC_MAX]; // Forwarder thread data
-void *mems[NIC_MAX];                  // NIC memory
-int fds[NIC_MAX];                     // netmap file descriptors
-pthread_mutex_t locks[NIC_MAX];       // Mutex for NIC memory access
-
 trie_t t4; // IPv4 forwarding table
 
-void setup()
-{
-  // Initialize everything per NIC
-  for(int n=0; n<NIC_MAX;n++) {
-    fds[n] = open("/dev/netmap", O_RDWR);    // Open socket
-    strcpy(nmreqs[n].nr_name, nic_names[n]); // Address NIC by name
-    nmreqs[n].nr_version = NETMAP_API;       // netmap version
-    nmreqs[n].nr_flags = NR_REG_ALL_NIC;     // Open all rings, hopefully there is only one anyway
-    nmreqs[n].nr_ringid = NETMAP_NO_TX_POLL; // Don't transmit when polling for RX data
-    ioctl(fds[n], NIOCREGIF, nmreqs+n);      // Open the interface for netmap mode
-    mems[n] = mmap(NULL, nmreqs[n].nr_memsize, PROT_READ|PROT_WRITE, MAP_SHARED, fds[n], 0); // Map NIC memory
-    nifps[n] = NETMAP_IF(mems[n], nmreqs[n].nr_offset); // Locate port memory
-    rxrings[n] = NETMAP_RXRING(nifps[n], 0); // Set up pointer to RX ring
-    txrings[n] = NETMAP_TXRING(nifps[n], 0); // Set up pointer to TX ring
-    pthread_mutex_init(locks+n, NULL);       // Initialize mutex
-    trie_init(&t4);                          // Initialize IPv4 forwarding table
+void *thread_main(void * f) {
+  struct forwarder *forwarder = f;
+  int fds[NIC_COUNT];           // File descriptor for netmap socket
+  struct nmreq reqs[NIC_COUNT]; // A struct for the netmap request
+  void * mem;                  // Pointer to allocated memory area
+  struct netmap_if *nifps[NIC_COUNT];   // Interfaces
+  struct netmap_ring *rxrings[NIC_COUNT]; // RX rings
+  struct netmap_ring *txrings[NIC_COUNT]; // TX rings
+  char tx_waiting[NIC_COUNT];
+  memset(reqs, 0, sizeof(struct nmreq) * NIC_COUNT);
+  memset(tx_waiting, 1, NIC_COUNT);
+
+  for(int n=0; n<NIC_COUNT;n++) {
+    fds[n] = open("/dev/netmap", O_RDWR);  // Open a generic netmap socket
+    strcpy(reqs[n].nr_name, nic_names[n]); // Copy NIC name into request
+    reqs[n].nr_version = NETMAP_API;       // Set version number
+    reqs[n].nr_flags = NR_REG_ONE_NIC;     // We will be using a single hardware ring
+    reqs[n].nr_ringid = NETMAP_NO_TX_POLL | NETMAP_HW_RING | forwarder->id; // Select ring, disable TX on poll
+    ioctl(fds[n], NIOCREGIF, &reqs[n]);       // Initialize netmap
+
+    //printf("interface: %s\n", reqs[n].nr_name);
+    //printf("memsize: %u\n", reqs[n].nr_memsize); // Check the allocated memory size
+    printf("nr_arg2: %u\n", reqs[n].nr_arg2);    // Check the allocated memory area
   }
-}
 
-// Do forwarding for a single NIC's incoming frames
-void *forward(void *c)
-{
-  struct forwarder *forwarder = c; // Configuration for this thread
+  // Map the memory
+  mem = mmap(NULL, reqs[0].nr_memsize, PROT_READ|PROT_WRITE, MAP_SHARED, fds[0], 0);
+  printf("mmap: %p\n", mem);
 
-  // Configuration for poll()
-  struct pollfd pollfd;
-  int fd = fds[forwarder->interface_id];
-  pollfd.fd = fd;
-  pollfd.events = POLLIN;
+  struct pollfd pollfds[NIC_COUNT];
 
-  // Pointers for this RX ring and a movable pointer for use with TX rings
-  struct netmap_ring *rxring = rxrings[forwarder->interface_id];
+  for(int n=0; n<NIC_COUNT;n++) {
+    nifps[n] = NETMAP_IF(mem, reqs[n].nr_offset); // Locate port memory
+    rxrings[n] = NETMAP_RXRING(nifps[n], forwarder->id); // Set up pointer to RX ring
+    txrings[n] = NETMAP_TXRING(nifps[n], forwarder->id); // Set up pointer to TX ring
+
+    pollfds[n].fd = fds[n];
+    pollfds[n].events = POLLIN;
+  }
+
+  // Pointers for the RX ring and TX ring
+  struct netmap_ring *rxring;
   struct netmap_ring *txring;
-  // Pointers for packet data
-  char *rxbuf;
-  char *txbuf;
 
   // Temporary variables for per-packet data
   uint32_t next_hop_ip = 0;
   uint8_t next_hop_interface = 1;
-  uint16_t interfaces_touched;
+
+  // Pointers for packet data
+  char *rxbuf;
+  char *txbuf;
 
   while (1) {
-    // Sleep, this is not really necessary but reduces CPU usage by waiting for more packets to be processed at once
-    usleep(10);
-    // Check for received packets
-    ioctl(fds[forwarder->interface_id], NIOCRXSYNC);
-    // If no packets are waiting, use poll() to wait
-    if(nm_ring_empty(rxring))
-      poll(&pollfd, 1, -1);
-    // No interfaces have been transmitted to yet
-    interfaces_touched = 0;
-    // Loop through all waiting packets
-    while (!nm_ring_empty(rxring)) {
-      // Find the RX packet data
-      rxbuf = NETMAP_BUF(rxring, rxring->slot[rxring->cur].buf_idx);
-      // Look up the destination in the IPv4 routing table
-      trie_node_search(&t4, rxbuf+30, &next_hop_ip, &next_hop_interface);
-      // Make a note that this interface needs to be flushed
-      interfaces_touched |= (1<<next_hop_interface);
-
-      // Find the TX ring
-      txring = txrings[next_hop_interface];
-      // Obtain mutex lock on TX interface
-      pthread_mutex_lock(locks+next_hop_interface);
-      // Check the TX interface isn't full
-      if(txring->cur != txring->tail) {
-        // Copy the packet length and data from RX to TX
-        txring->slot[txring->cur].len = rxring->slot[rxring->cur].len;
-        txbuf = NETMAP_BUF(txring, txring->slot[txring->cur].buf_idx);
-        memcpy(txbuf, rxbuf, rxring->slot[rxring->cur].len);
-        // Advance the TX ring pointer
-        txring->head = txring->cur = nm_ring_next(txring, txring->cur);
-      }
-      // Release lock
-      pthread_mutex_unlock(locks+next_hop_interface);
-      // Advance the RX ring pointer
-      rxring->head = rxring->cur = nm_ring_next(rxring, rxring->cur);
-    }
-
-    // Flush data to each interfaces if needed
-    for(int n=0; n<NIC_MAX; n++) {
-      if(interfaces_touched & (1<<n))
+    //usleep(20);
+    poll(pollfds, NIC_COUNT, -1);
+    //printf("Poll! Ring:%u Pollfds: %u %u %u %u\n", forwarder->id, pollfds[0].revents, pollfds[1].revents,pollfds[2].revents,pollfds[3].revents);
+    for(int n=0; n<NIC_COUNT; n++) {
+      //ioctl(fds[n], NIOCRXSYNC);
+      if(tx_waiting[n]) {
         ioctl(fds[n], NIOCTXSYNC);
+        tx_waiting[n] = 0;
+      }
+      rxring = rxrings[n];
+      //printf("Checking NIC. Interface:%u Ring:%u Info: %u %u %u\n", n, forwarder->id, rxring->head, rxring->cur, rxring->tail);
+      while (!nm_ring_empty(rxring)) {
+        //printf("Frame received. Interface:%u Ring:%u\n", n, forwarder->id);
+        rxbuf = NETMAP_BUF(rxring, rxring->slot[rxring->cur].buf_idx);
+        trie_node_search(&t4, rxbuf+30, &next_hop_ip, &next_hop_interface);
+        txring = txrings[next_hop_interface];
+        if(txring->cur != txring->tail) {
+          // Copy the packet length and data from RX to TX
+          txring->slot[txring->cur].len = rxring->slot[rxring->cur].len;
+
+          // Buffer swap
+          uint32_t pkt = rxring->slot[rxring->cur].buf_idx;
+          rxring->slot[rxring->cur].buf_idx = txring->slot[txring->cur].buf_idx;
+          txring->slot[txring->cur].buf_idx = pkt;
+
+          // The buffer in case we want to modify the frame
+          txbuf = NETMAP_BUF(txring, txring->slot[txring->cur].buf_idx);
+
+          // Advance the TX ring pointer
+          txring->head = txring->cur = nm_ring_next(txring, txring->cur);
+        }
+        tx_waiting[next_hop_interface] = 1;
+        rxrings[n]->head = rxrings[n]->cur = nm_ring_next(rxrings[n], rxrings[n]->cur);
+      }
     }
   }
 }
@@ -119,10 +113,8 @@ int main(int argc, char **argv)
   // Hello world
   fprintf(stderr, "%s built %s %s\n", argv[0], __DATE__, __TIME__);
 
-  // Initialize everything
-  setup();
-
-  // Populate some ficticious route data
+  // Populate routing table
+  trie_init(&t4);
   uint32_t ip_r;
   for(int n=0;n<1000000;n++) { // 1 Million IPs
     ip_r = htonl(167772160+n); // 10.0.0.0 + n
@@ -131,15 +123,15 @@ int main(int argc, char **argv)
   }
 
   // Start all forwarders
-  for(int n=0; n<NIC_MAX; n++) {
-    forwarders[n].interface_id = n;
-    pthread_create(&forwarders[n].thread, NULL, forward, forwarders+n);
+  struct forwarder forwarder[RING_COUNT];
+  for(int n=0; n<RING_COUNT; n++) {
+    forwarder[n].id = n;
+    pthread_create(&forwarder[n].thread, NULL, thread_main, &forwarder[n]);
   }
 
   // Join threads for completeness
-  for(int n=0; n<NIC_MAX; n++) {
-    pthread_join(forwarders[n].thread, NULL);
+  for(int n=0; n<RING_COUNT; n++) {
+    pthread_join(forwarder[n].thread, NULL);
   }
-
   return(0);
 }

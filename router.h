@@ -1,7 +1,7 @@
 struct forwarder
 {
   pthread_t thread;
-  uint8_t interface_id;
+  uint8_t id;
 };
 
 struct mac_entry
