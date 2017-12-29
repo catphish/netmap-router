@@ -10,15 +10,22 @@
 #include <pthread.h>
 #include <sched.h>
 #include <unistd.h>
+#include <sys/epoll.h>
 #include "trie.h"
 #include "router.h"
 
 #define NIC_COUNT 4
 #define RING_COUNT 4
+#define MAXEVENTS 32
 char *nic_names[] = {"enp8s0f0","enp8s0f1","enp8s0f2","enp8s0f3"};
 trie_t t4; // IPv4 forwarding table
 
 void *thread_main(void * f) {
+  int epollfd;
+  struct epoll_event event;
+  struct epoll_event *events;
+  epollfd = epoll_create1(0);
+
   struct forwarder *forwarder = f;
   int fds[NIC_COUNT];           // File descriptor for netmap socket
   struct nmreq reqs[NIC_COUNT]; // A struct for the netmap request
@@ -49,6 +56,9 @@ void *thread_main(void * f) {
     nifps[n] = NETMAP_IF(mem, reqs[n].nr_offset); // Locate port memory
     rxrings[n] = NETMAP_RXRING(nifps[n], forwarder->id); // Set up pointer to RX ring
     txrings[n] = NETMAP_TXRING(nifps[n], forwarder->id); // Set up pointer to TX ring
+    event.data.fd = fds[n];
+    event.events = EPOLLIN;
+    epoll_ctl (epollfd, EPOLL_CTL_ADD, fds[n], &event);
   }
 
   // Pointers for the RX ring and TX ring
@@ -67,7 +77,7 @@ void *thread_main(void * f) {
   unsigned int batch_count;
 
   while (1) {
-    usleep(500);
+    epoll_wait (epollfd, events, MAXEVENTS, -1);
     if(batch_count == 10000) {
       printf("Average batch: %u\n", batch_total / batch_count);
       batch_total = 0;
@@ -83,7 +93,7 @@ void *thread_main(void * f) {
         batch_total++;
         //printf("Frame received. Interface:%u Ring:%u\n", n, forwarder->id);
         rxbuf = NETMAP_BUF(rxring, rxring->slot[rxring->cur].buf_idx);
-        //trie_node_search(&t4, rxbuf+30, &next_hop_ip, &next_hop_interface);
+        trie_node_search(&t4, rxbuf+30, &next_hop_ip, &next_hop_interface);
         txring = txrings[next_hop_interface];
         if(txring->cur != txring->tail) {
           // Copy the packet length and data from RX to TX
