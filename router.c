@@ -68,13 +68,14 @@ void *thread_main(void * f) {
   unsigned int batch_count;
 
   while (1) {
-    if(batch_count == 10000) {
+    if(batch_count == 1000000) {
       printf("Thread %u Average batch: %u\n", forwarder->id, batch_total / batch_count);
       batch_total = 0;
       batch_count = 0;
     }
     batch_count++;
     for(int n=0; n<NIC_COUNT; n++) {
+      ioctl(fds[n], NIOCTXSYNC);
       ioctl(fds[n], NIOCRXSYNC);
       rxring = rxrings[n];
       //printf("Checking NIC. Interface:%u Ring:%u Info: %u %u %u\n", n, forwarder->id, rxring->head, rxring->cur, rxring->tail);
@@ -101,10 +102,6 @@ void *thread_main(void * f) {
         }
         rxring->head = rxring->cur = nm_ring_next(rxring, rxring->cur);
       }
-    }
-    // Flush TX on all NICs
-    for(int n=0; n<NIC_COUNT; n++) {
-      ioctl(fds[n], NIOCTXSYNC);
     }
   }
 }
