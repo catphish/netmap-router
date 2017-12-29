@@ -10,22 +10,16 @@
 #include <pthread.h>
 #include <sched.h>
 #include <unistd.h>
-#include <sys/epoll.h>
 #include "trie.h"
 #include "router.h"
 
 #define NIC_COUNT 4
 #define RING_COUNT 4
-#define MAXEVENTS 32
+
 char *nic_names[] = {"enp8s0f0","enp8s0f1","enp8s0f2","enp8s0f3"};
 trie_t t4; // IPv4 forwarding table
 
 void *thread_main(void * f) {
-  int epollfd;
-  struct epoll_event event;
-  struct epoll_event *events;
-  epollfd = epoll_create1(0);
-
   struct forwarder *forwarder = f;
   int fds[NIC_COUNT];           // File descriptor for netmap socket
   struct nmreq reqs[NIC_COUNT]; // A struct for the netmap request
@@ -40,8 +34,8 @@ void *thread_main(void * f) {
     strcpy(reqs[n].nr_name, nic_names[n]); // Copy NIC name into request
     reqs[n].nr_version = NETMAP_API;       // Set version number
     reqs[n].nr_flags = NR_REG_ONE_NIC;     // We will be using a single hardware ring
-    reqs[n].nr_ringid = forwarder->id; // Select ring, disable TX on poll
-    ioctl(fds[n], NIOCREGIF, &reqs[n]);       // Initialize netmap
+    reqs[n].nr_ringid = NETMAP_NO_TX_POLL | forwarder->id; // Select ring, disable TX on poll
+    ioctl(fds[n], NIOCREGIF, &reqs[n]);    // Initialize port
 
     //printf("interface: %s\n", reqs[n].nr_name);
     //printf("memsize: %u\n", reqs[n].nr_memsize); // Check the allocated memory size
@@ -56,9 +50,6 @@ void *thread_main(void * f) {
     nifps[n] = NETMAP_IF(mem, reqs[n].nr_offset); // Locate port memory
     rxrings[n] = NETMAP_RXRING(nifps[n], forwarder->id); // Set up pointer to RX ring
     txrings[n] = NETMAP_TXRING(nifps[n], forwarder->id); // Set up pointer to TX ring
-    event.data.fd = fds[n];
-    event.events = EPOLLIN;
-    epoll_ctl (epollfd, EPOLL_CTL_ADD, fds[n], &event);
   }
 
   // Pointers for the RX ring and TX ring
@@ -77,15 +68,13 @@ void *thread_main(void * f) {
   unsigned int batch_count;
 
   while (1) {
-    epoll_wait (epollfd, events, MAXEVENTS, -1);
     if(batch_count == 10000) {
-      printf("Average batch: %u\n", batch_total / batch_count);
+      printf("Thread %u Average batch: %u\n", forwarder->id, batch_total / batch_count);
       batch_total = 0;
       batch_count = 0;
     }
     batch_count++;
     for(int n=0; n<NIC_COUNT; n++) {
-      ioctl(fds[n], NIOCTXSYNC);
       ioctl(fds[n], NIOCRXSYNC);
       rxring = rxrings[n];
       //printf("Checking NIC. Interface:%u Ring:%u Info: %u %u %u\n", n, forwarder->id, rxring->head, rxring->cur, rxring->tail);
@@ -109,11 +98,13 @@ void *thread_main(void * f) {
 
           // Advance the TX ring pointer
           txring->head = txring->cur = nm_ring_next(txring, txring->cur);
-        //} else {
-        //  printf(".");
         }
-        rxrings[n]->head = rxrings[n]->cur = nm_ring_next(rxrings[n], rxrings[n]->cur);
+        rxring->head = rxring->cur = nm_ring_next(rxring, rxring->cur);
       }
+    }
+    // Flush TX on all NICs
+    for(int n=0; n<NIC_COUNT; n++) {
+      ioctl(fds[n], NIOCTXSYNC);
     }
   }
 }
