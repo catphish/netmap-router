@@ -41,14 +41,15 @@ void *thread_main(void * f) {
     reqs[n].nr_ringid = forwarder->id;     // Select ring, disable TX on poll
     ioctl(fds[n], NIOCREGIF, &reqs[n]);    // Initialize port
 
-    //printf("interface: %s\n", reqs[n].nr_name);
-    //printf("memsize: %u\n", reqs[n].nr_memsize); // Check the allocated memory size
-    printf("nr_arg2: %u\n", reqs[n].nr_arg2);    // Check the allocated memory area
+    // Check the allocated memory area.
+    if(reqs[n].nr_arg2 != 1) {
+      fprintf(stderr, "Ring was mapped to memory area %u. Expected 1!\n", reqs[n].nr_arg2);
+      return(NULL);
+    }
   }
 
   // Map the memory
   mem = mmap(NULL, reqs[0].nr_memsize, PROT_READ|PROT_WRITE, MAP_SHARED, fds[0], 0);
-  printf("mmap: %p\n", mem);
 
   struct pollfd pollfds[NIC_COUNT];
   for(int n=0; n<NIC_COUNT;n++) {
@@ -91,6 +92,7 @@ void *thread_main(void * f) {
       ioctl(fds[n], NIOCTXSYNC);
       rxring = rxrings[n];
       while (!nm_ring_empty(rxring)) {
+        // Increment packet count for stats
         batch_total++;
         // Find the packet in the RX buffer
         rxbuf = NETMAP_BUF(rxring, rxring->slot[rxring->cur].buf_idx);
