@@ -38,7 +38,7 @@ void *thread_main(void * f) {
     strcpy(reqs[n].nr_name, nic_names[n]); // Copy NIC name into request
     reqs[n].nr_version = NETMAP_API;       // Set version number
     reqs[n].nr_flags = NR_REG_ONE_NIC;     // We will be using a single hardware ring
-    reqs[n].nr_ringid = forwarder->id;     // Select ring, disable TX on poll
+    reqs[n].nr_ringid = NETMAP_NO_TX_POLL | forwarder->id; // Select ring, disable TX on poll
     ioctl(fds[n], NIOCREGIF, &reqs[n]);    // Initialize port
 
     // Check the allocated memory area.
@@ -72,10 +72,26 @@ void *thread_main(void * f) {
   char *rxbuf;
   char *txbuf;
 
+  // Variables to track statistics
   unsigned int batch_total;
   unsigned int batch_count;
 
+  // An array to mark TX rings as needing to be flushed
+  char interface_dirty[NIC_COUNT];
+  // Flush all interfaces on first iteration
+  memset(interface_dirty, 1, NIC_COUNT);
+
   while (1) {
+    // Push out any frames waiting in TX queues from previous iteration
+    for(int n=0; n<NIC_COUNT; n++) {
+      if(interface_dirty[n]) {
+        // Sync TX queue
+        ioctl(fds[n], NIOCTXSYNC);
+        // Mark the interface as clean
+        interface_dirty[n] = 0;
+      }
+    }
+
     // Use poll to wait for one or more interfaces to have frames waiting
     poll(pollfds, NIC_COUNT, -1);
 
@@ -89,7 +105,6 @@ void *thread_main(void * f) {
 
     // Loop over all NICs and check for waiting frames
     for(int n=0; n<NIC_COUNT; n++) {
-      ioctl(fds[n], NIOCTXSYNC);
       rxring = rxrings[n];
       while (!nm_ring_empty(rxring)) {
         // Increment packet count for stats
@@ -117,6 +132,8 @@ void *thread_main(void * f) {
           // Advance the TX ring pointer
           txring->head = txring->cur = nm_ring_next(txring, txring->cur);
         }
+        // Mark the TX interface as dirty so it will be flushed
+        interface_dirty[next_hop_interface] = 1;
         // Advance the RX ring pointer
         rxring->head = rxring->cur = nm_ring_next(rxring, rxring->cur);
       }
