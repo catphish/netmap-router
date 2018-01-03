@@ -65,8 +65,8 @@ void *thread_main(void * f) {
   struct netmap_ring *txring;
 
   // Temporary variables for per-packet data
-  uint32_t next_hop_ip = 0;
-  uint8_t next_hop_interface = 1;
+  uint32_t next_hop_ip;
+  uint8_t next_hop_interface;
 
   // Pointers for packet data
   char *rxbuf;
@@ -109,31 +109,34 @@ void *thread_main(void * f) {
       while (!nm_ring_empty(rxring)) {
         // Increment packet count for stats
         batch_total++;
+
         // Find the packet in the RX buffer
         rxbuf = NETMAP_BUF(rxring, rxring->slot[rxring->cur].buf_idx);
+
         // Assume the frame is an IPv4 packet and perform a lookup
-        trie_node_search(&t4, rxbuf+30, &next_hop_ip, &next_hop_interface);
-        // Fetch the appropriate TX ring
-        txring = txrings[next_hop_interface];
+        if(trie_node_search(&t4, rxbuf+30, &next_hop_ip, &next_hop_interface)) {
+          // Fetch the appropriate TX ring
+          txring = txrings[next_hop_interface];
 
-        // Check for space in the TX ring
-        if(nm_ring_space(txring)) {
-          // Copy the packet length and data from RX to TX
-          txring->slot[txring->cur].len = rxring->slot[rxring->cur].len;
+          // Check for space in the TX ring
+          if(nm_ring_space(txring)) {
+            // Copy the packet length and data from RX to TX
+            txring->slot[txring->cur].len = rxring->slot[rxring->cur].len;
 
-          // Zero-copy buffer swap
-          uint32_t pkt = rxring->slot[rxring->cur].buf_idx;
-          rxring->slot[rxring->cur].buf_idx = txring->slot[txring->cur].buf_idx;
-          txring->slot[txring->cur].buf_idx = pkt;
+            // Zero-copy buffer swap
+            uint32_t pkt = rxring->slot[rxring->cur].buf_idx;
+            rxring->slot[rxring->cur].buf_idx = txring->slot[txring->cur].buf_idx;
+            txring->slot[txring->cur].buf_idx = pkt;
 
-          // Find the buffer buffer in case we want to modify the frame (TTL etc)
-          txbuf = NETMAP_BUF(txring, txring->slot[txring->cur].buf_idx);
+            // Find the buffer buffer in case we want to modify the frame (TTL etc)
+            txbuf = NETMAP_BUF(txring, txring->slot[txring->cur].buf_idx);
 
-          // Advance the TX ring pointer
-          txring->head = txring->cur = nm_ring_next(txring, txring->cur);
+            // Advance the TX ring pointer
+            txring->head = txring->cur = nm_ring_next(txring, txring->cur);
+          }
+          // Mark the TX interface as dirty so it will be flushed
+          interface_dirty[next_hop_interface] = 1;
         }
-        // Mark the TX interface as dirty so it will be flushed
-        interface_dirty[next_hop_interface] = 1;
         // Advance the RX ring pointer
         rxring->head = rxring->cur = nm_ring_next(rxring, rxring->cur);
       }
@@ -148,11 +151,14 @@ int main(int argc, char **argv)
 
   // Populate IPv4 routing table
   trie_init(&t4);
-  uint32_t ip_r;
-  for(int n=0;n<1000000;n++) { // 1 Million IPs
-    ip_r = htonl(167772160+n); // 10.0.0.0 + n
+  uint32_t ip_r = 0;
+  for(int n=0;n<1000000;n+=2) { // 1 Million IPs
     // Insert into IPv4 routing table, next-hop local broadcast (IP 0) to interface 1
+    ip_r = htonl(167772160+n); // 10.0.0.0 + n
     trie_node_put(&t4, (char*)&ip_r, 32, 0, 1);
+    // Insert into IPv4 routing table, next-hop local broadcast (IP 0) to interface 3
+    ip_r = htonl(167772160+n+1); // 10.0.0.0 + n + 1
+    trie_node_put(&t4, (char*)&ip_r, 32, 0, 3);
   }
 
   // A struct to hold thread information
@@ -172,5 +178,6 @@ int main(int argc, char **argv)
   for(int n=0; n<RING_COUNT; n++) {
     pthread_join(forwarder[n].thread, NULL);
   }
+
   return(0);
 }
